@@ -62,3 +62,10 @@ disk at runtime.
 - `request_timeout`: HTTP request timeout in seconds.
 
 See [Deployment README](../../../deployments/README.md).
+
+### Optional Nomadic annotations
+
+Use **Auto Annotate with Nomadic** on a saved episode to generate timestamped robot actions. This optional integration
+is disabled by default. The FR3 Duo example uses its existing I/O contract to map cameras and robot measurements; its
+Nomadic deployment override only requires a new API key. See
+[setup, configuration overrides and usage](docs/nomadic-annotations.md).
