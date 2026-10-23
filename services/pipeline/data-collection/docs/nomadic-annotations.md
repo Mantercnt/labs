@@ -123,9 +123,11 @@ are left empty rather than inferred from descriptions.
 An episode must be saved and have the processor's `.processing_complete` marker. A single processed MCAP is required;
 raw recordings and multi-file stitching are not supported by this integration.
 
-LABS whole-video camera messages are converted to H.264 frames using their original frame timestamps. Existing supported
-compressed frames or images are preserved. Other sensor messages, metadata and attachments are retained. Invalid camera
-encodings, mismatched frame counts and non-increasing camera timestamps are rejected before upload.
+LABS whole-video camera messages are converted to H.264 frames. For the reference station, camera clocks are anchored
+to the recorded capture stamps and aligned to the head camera's fixed playback rate. Short gaps repeat the nearest frame;
+the prepared spec records camera offsets and repeated frames. Long gaps, mismatched frame counts and non-increasing
+timestamps are rejected before upload. Existing supported compressed frames or images are preserved. Original sensor
+messages, metadata and attachments remain in the prepared copy.
 
 ### Reference station mapping
 
@@ -135,12 +137,20 @@ The reference adapter derives camera and measurement mappings from the checked-i
 - `config_contract_gr00t.yml` supplies processed camera topic names, measured fields and ordered joint names through the
   existing `pipeline-configs` models.
 - The Robotiq driver documents its measured knuckle range: 0 radians open and 0.8 radians closed. The adapter retains
-  the original angle and adds `1 - angle / 0.8` as the normalized opening fraction expected by Nomadic.
+  the original angle and adds `angle / 0.8` as normalized gripper closedness: 0 fully open, 1 fully closed.
 
-The adapter adds `nomadic.Signal` channels for both arms' measured joint positions, velocities, external joint torques,
-gripper angles and external wrenches. Both arm tracks reference the measured joints, normalized grip and wrench. Camera
-timestamps and all original ROS messages, including commands and transforms, are retained. Gripper opening comes from
-the measured knuckle angle. End-effector poses and camera calibration are not computed by the adapter.
+The adapter adds `nomadic.Signal` channels for measured joint positions, velocities, torques, gripper angles, gripper
+velocities, normalized gripper closedness and external wrenches. Recorded arm and gripper commands are separate signals.
+Measurements use ROS capture stamps; headerless commands use MCAP recording timestamps. The saved episode JSON supplies
+the task instruction when present, taking precedence over embedded episode context.
+
+Each arm also has a derived flange pose from the nominal FR3 geometry. The adapter applies the arm-base transforms in
+`/tf_static` so both poses use the same recorded parent frame. Missing, conflicting or disconnected base transforms are
+rejected. These are not measured gripper TCP poses, and recorded transforms do not establish physical calibration.
+If both bases are recorded at the same position, the integration warns that the viewer shows nominal placement.
+A correctly positioned combined 3D view still requires station calibration. Recorded camera intrinsics are copied from
+`CameraInfo`; camera extrinsics are not inferred. Joint measurements remain available as signals, while trajectory
+parts use flange poses to avoid selecting an unrelated robot model in the viewer.
 
 Unsupported contract layouts, missing channels, ambiguous joint names and invalid measurements fail before upload.
 Verify the resulting camera views and trajectory on a representative station recording. Action definitions and boundary

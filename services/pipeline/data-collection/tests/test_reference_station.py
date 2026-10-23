@@ -50,9 +50,58 @@ float64 z
 """
     + HEADER
 )
+TRANSFORMS = (
+    """geometry_msgs/TransformStamped[] transforms
+================================================================================
+MSG: geometry_msgs/TransformStamped
+std_msgs/Header header
+string child_frame_id
+geometry_msgs/Transform transform
+================================================================================
+MSG: geometry_msgs/Transform
+geometry_msgs/Vector3 translation
+geometry_msgs/Quaternion rotation
+================================================================================
+MSG: geometry_msgs/Vector3
+float64 x
+float64 y
+float64 z
+================================================================================
+MSG: geometry_msgs/Quaternion
+float64 x
+float64 y
+float64 z
+float64 w
+"""
+    + HEADER
+)
 
 
-def raw_reference_recording(path: Path, *, bad_joint: bool = False, gripper_angle: float | None = None) -> None:
+def base_transform(
+    side: str,
+    *,
+    parent: str = "base",
+    translation: tuple[float, float, float] = (0, 0, 0),
+    rotation: tuple[float, float, float, float] = (0, 0, 0, 1),
+) -> dict[str, Any]:
+    seconds, nanos = divmod(T0, 1_000_000_000)
+    return {
+        "header": {"stamp": {"sec": seconds, "nanosec": nanos}, "frame_id": parent},
+        "child_frame_id": f"{side}_fr3_link0",
+        "transform": {
+            "translation": dict(zip("xyz", translation, strict=True)),
+            "rotation": dict(zip("xyzw", rotation, strict=True)),
+        },
+    }
+
+
+def raw_reference_recording(
+    path: Path,
+    *,
+    bad_joint: bool = False,
+    gripper_angle: float | None = None,
+    base_transforms: list[dict[str, Any]] | None = None,
+) -> None:
     """Generate ROS 2 CDR data from the actual reference contract, without a ROS installation."""
     contract = PolicyContract.from_yaml(CONTRACT)
     with ROSWriter(str(path)) as writer:
@@ -60,6 +109,17 @@ def raw_reference_recording(path: Path, *, bad_joint: bool = False, gripper_angl
         wrench_schema = writer.register_msgdef("geometry_msgs/msg/WrenchStamped", WRENCH)
         image_schema = writer.register_msgdef("sensor_msgs/msg/Image", IMAGE)
         command_schema = writer.register_msgdef("std_msgs/msg/Float32", "float32 data\n")
+        tf_schema = writer.register_msgdef("tf2_msgs/msg/TFMessage", TRANSFORMS)
+        transforms = (
+            base_transforms if base_transforms is not None else [base_transform("left"), base_transform("right")]
+        )
+        writer.write_message(
+            "/tf_static",
+            tf_schema,
+            {"transforms": transforms},
+            log_time=T0,
+            publish_time=T0,
+        )
         for index in range(3):
             timestamp = T0 + index * 100_000_000
             seconds, nanos = divmod(timestamp, 1_000_000_000)
@@ -125,12 +185,12 @@ def raw_reference_recording(path: Path, *, bad_joint: bool = False, gripper_angl
                 )
 
 
-def processed_reference_recording(path: Path, **kwargs: Any) -> None:  # noqa: ANN401 -- Fixture overrides.
+def processed_reference_recording(path: Path, *, video_frames: int = 3, **kwargs: Any) -> None:  # noqa: ANN401 -- Fixture overrides.
     """Combine real ROS messages with small whole-video streams for fast adapter tests."""
     contract = PolicyContract.from_yaml(CONTRACT)
     raw, video = path.with_suffix(".raw.mcap"), path.with_suffix(".video.mcap")
     raw_reference_recording(raw, **kwargs)
-    times = processed_recording(video)
+    times = processed_recording(video, frame_count=video_frames, timestamp_count=video_frames)
     with path.open("wb") as output:
         writer = Writer(output)
         writer.start()
@@ -209,12 +269,17 @@ def test_reference_preparation_converts_measurements_and_preserves_ros(tmp_path:
     processed_reference_recording(source)
     original_hash = file_digest(source)
     _, warnings = RecordingPreparer(None, CONTRACT).prepare(source, output, uuid7.create())
-    assert not warnings and file_digest(source) == original_hash
+    assert warnings == ["Recorded arm bases coincide; trajectories show nominal placement, not calibrated arm spacing."]
+    assert file_digest(source) == original_hash
     spec, signals = read_prepared(output)
-    assert len(spec["views"]) == 3 and len(spec["signals"]) == 12
+    assert len(spec["views"]) == 3 and len(spec["signals"]) == 18
     assert spec["recording"]["task"]["instruction"] == "Place both cubes in bowls"
-    assert [row.number for _, row in signals["/nomadic/labs/left_gripper_open"]] == [1, 0.5, 0]
-    assert [row.number for _, row in signals["/nomadic/labs/right_gripper_open"]] == [0, 0.5, 1]
+    assert [row.number for _, row in signals["/nomadic/labs/left_gripper_closed"]] == [0, 0.5, 1]
+    assert [row.number for _, row in signals["/nomadic/labs/right_gripper_closed"]] == [1, 0.5, 0]
+    assert [part["grip"]["signal"] for part in spec["recording"]["platform"]["parts"]] == [
+        "left_gripper_closed",
+        "right_gripper_closed",
+    ]
     assert list(signals["/nomadic/labs/left_arm_position"][0][1].vector.values) == pytest.approx(
         [i / 10 for i in range(1, 8)]
     )
@@ -290,5 +355,5 @@ def test_actual_labs_processor_output(tmp_path: Path, monkeypatch: pytest.Monkey
     converter.convert()
     RecordingPreparer(None, CONTRACT).prepare(processed, prepared, uuid7.create())
     spec, signals = read_prepared(prepared)
-    assert len(spec["views"]) == 3 and len(signals) == 12
-    assert [row.number for _, row in signals["/nomadic/labs/left_gripper_open"]] == [1, 0.5, 0]
+    assert len(spec["views"]) == 3 and len(signals) == 18
+    assert [row.number for _, row in signals["/nomadic/labs/left_gripper_closed"]] == [0, 0.5, 1]

@@ -25,6 +25,7 @@ from mcap.summary import Summary
 from mcap.writer import Writer
 from mcap_protobuf.decoder import DecoderFactory
 
+from annotations.cameras import CameraPlan, alignment_plan, camera_frame, write_calibrations
 from annotations.reference_station import ReferenceStationMapping
 
 
@@ -89,20 +90,40 @@ def _camera_timestamp(current: int, previous: int) -> int:
     return current
 
 
-def _video_packets(payload: bytes, timestamps: list[int]) -> Iterator[tuple[int, bytes]]:
+def _selected_frames(
+    container: av.container.InputContainer, timestamps: list[int], plan: CameraPlan | None
+) -> Iterator[av.VideoFrame]:
+    """Select source frames with bounded memory and verify the complete source frame count."""
+    frames = iter(container.decode(video=0))
+    current = None
+    source_index = -1
+    for selected in plan.indices if plan else range(len(timestamps)):
+        while source_index < selected:
+            current = next(frames, None)
+            if current is None:
+                raise ValueError("Video/frame timestamp counts differ; the decoded video has fewer frames.")
+            source_index += 1
+        if current is None:
+            raise ValueError("The decoded video has no frames.")
+        yield current
+    count = source_index + 1 + sum(1 for _ in frames)
+    if count != (plan.source_count if plan else len(timestamps)):
+        raise ValueError("Video/frame timestamp counts differ; refusing to fabricate or drop frame times.")
+
+
+def _video_packets(
+    payload: bytes, timestamps: list[int], plan: CameraPlan | None = None
+) -> Iterator[tuple[int, bytes]]:
     """Stream decoded frames through a low-latency encoder, keeping original timestamps."""
     if not timestamps or any(type(t) is not int for t in timestamps):
         raise ValueError("Camera frame timestamps must be integer nanoseconds.")
     if any(a >= b for a, b in pairwise(timestamps)):
         raise ValueError("Camera timestamps must be strictly increasing; duplicates cannot be repaired safely.")
     encoder = None
-    frame_count = 0
     packet_count = 0
     with av.open(io.BytesIO(payload), mode="r") as container:
         container.streams.video[0].codec_context.thread_count = 1
-        for index, frame in enumerate(container.decode(video=0)):
-            if index >= len(timestamps):
-                raise ValueError("The decoded video has more frames than the LABS timestamp metadata.")
+        for index, frame in enumerate(_selected_frames(container, timestamps, plan)):
             if encoder is None:
                 encoder = _encoder(frame, timestamps)
             frame.pts = index
@@ -110,13 +131,36 @@ def _video_packets(payload: bytes, timestamps: list[int]) -> Iterator[tuple[int,
             for packet in encoder.encode(frame):
                 packet_count += 1
                 yield _packet_time(packet, timestamps), bytes(packet)
-            frame_count += 1
         if encoder:
             for packet in encoder.encode(None):
                 packet_count += 1
                 yield _packet_time(packet, timestamps), bytes(packet)
-    if frame_count != len(timestamps) or packet_count != frame_count:
+    if packet_count != len(timestamps):
         raise ValueError("Video/frame timestamp counts differ; refusing to fabricate or drop frame times.")
+
+
+def _record_provenance(source: Path, episode_id: UUID, spec: dict[str, Any], plans: dict[str, CameraPlan]) -> None:
+    """Prefer the saved episode metadata and record every temporal adjustment."""
+    episode_file = source.parent.parent / "episode_metadata.json"
+    if episode_file.is_file():
+        episode = json.loads(episode_file.read_text())
+        if episode.get("episode_id") != str(episode_id):
+            raise ValueError("Episode metadata does not match the recording being prepared.")
+        if instruction := episode.get("task_description"):
+            spec["recording"]["task"] = {"instruction": instruction}
+        spec.setdefault("source", {})["task_metadata_origin"] = "episode_metadata.json"
+    if plans:
+        spec.setdefault("source", {})["camera_alignment"] = {
+            topic: {
+                "offset_ns": plan.offset_ns,
+                "source_frames": plan.source_count,
+                "output_frames": len(plan.indices),
+                "repeated_frames": [
+                    index for index in range(1, len(plan.indices)) if plan.indices[index] == plan.indices[index - 1]
+                ],
+            }
+            for topic, plan in plans.items()
+        }
 
 
 class RecordingPreparer:
@@ -143,12 +187,16 @@ class RecordingPreparer:
         topics = {channel.topic for channel in summary.channels.values()}
         mapped_topics = topics | ({binding.channel for binding in reference.bindings} if reference else set())
         warnings = _check_spec(spec, mapped_topics)
+        if reference:
+            warnings.extend(reference.configure_frames(source))
         conversion: dict[str, Any] = next(
             (json.loads(m.metadata["data"]) for m in metadata if m.name == "conversion_info"), {}
         )
         # Prepared copies retain conversion_info, but already contain per-frame camera messages.
         prepared_copy = any(record.name == "nomadic_preparation" for record in metadata)
         boundaries = {} if prepared_copy else conversion.get("frame_boundaries") or {}
+        plans = alignment_plan(source, boundaries, spec["views"], spec["primary_view"]) if reference else {}
+        _record_provenance(source, episode_id, spec, plans)
         camera_topics = {view["channel"] for view in spec["views"]}
         spec["recording"].update(id=str(episode_id), clock="log_time")
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -160,9 +208,10 @@ class RecordingPreparer:
                 for record in metadata:
                     if record.name not in {"nomadic_spec", "nomadic_preparation"}:
                         writer.add_metadata(record.name, record.metadata)
-                self._copy_messages(writer, handle, summary, camera_topics, boundaries, spec)
+                self._copy_messages(writer, handle, summary, camera_topics, boundaries, spec, plans)
                 if reference:
                     reference.write_signals(writer, source)
+                    write_calibrations(writer, source, reference.contract.cameras)
                 handle.seek(0)
                 for attachment in make_reader(handle).iter_attachments():
                     writer.add_attachment(
@@ -229,6 +278,7 @@ class RecordingPreparer:
         camera_topics: set[str],
         boundaries: dict[str, Any],
         spec: dict[str, Any],
+        plans: dict[str, CameraPlan],
     ) -> None:
         schemas: dict[int, int] = {}
         registered: dict[int, int] = {}
@@ -240,6 +290,9 @@ class RecordingPreparer:
             target = self._register(writer, schema, channel, schemas, registered)
             if channel.topic in camera_topics:
                 timestamps = (boundaries.get(channel.topic) or {}).get("frame_timestamps")
+                plan = plans.get(channel.topic)
+                if plan:
+                    timestamps = plan.timestamps
                 if timestamps:
                     if channel.topic in seen_cameras:
                         raise ValueError("Whole-video camera topics must contain exactly one message.")
@@ -252,18 +305,7 @@ class RecordingPreparer:
                     if decoder is None:
                         raise ValueError("Cannot decode the processed camera schema.")
                     decoded = decoder(message.data)
-                    for sequence, (timestamp, payload) in enumerate(_video_packets(decoded.data, timestamps)):
-                        encoded = type(decoded)()
-                        encoded.CopyFrom(decoded)
-                        encoded.data, encoded.format = payload, "h264"
-                        encoded.timestamp.seconds, encoded.timestamp.nanos = divmod(timestamp, 1_000_000_000)
-                        writer.add_message(
-                            target,
-                            timestamp,
-                            encoded.SerializeToString(),
-                            publish_time=timestamp,
-                            sequence=sequence,
-                        )
+                    self._write_video(writer, target, decoded, timestamps, plan, channel.topic, spec)
                     timestamp = timestamps[0]
                 else:
                     last_camera_time[channel.topic] = _camera_timestamp(
@@ -294,6 +336,33 @@ class RecordingPreparer:
         if camera_topics != seen_cameras or first_camera_time is None:
             raise ValueError("Every declared camera must contain messages.")
         spec["recording"]["t0_ns"] = first_camera_time
+
+    @staticmethod
+    def _write_video(  # noqa: PLR0913
+        writer: Writer,
+        target: int,
+        decoded: Any,  # noqa: ANN401 -- Dynamic protobuf camera type.
+        timestamps: list[int],
+        plan: CameraPlan | None,
+        topic: str,
+        spec: dict[str, Any],
+    ) -> None:
+        """Emit independent H.264 access units on the selected presentation clock."""
+        for sequence, (timestamp, payload) in enumerate(_video_packets(decoded.data, timestamps, plan)):
+            encoded = type(decoded)()
+            encoded.CopyFrom(decoded)
+            encoded.data, encoded.format = payload, "h264"
+            if plan:
+                role = next(view["role"] for view in spec["views"] if view["channel"] == topic)
+                encoded.frame_id = camera_frame("head" if role == "front" else role)
+            encoded.timestamp.seconds, encoded.timestamp.nanos = divmod(timestamp, 1_000_000_000)
+            writer.add_message(
+                target,
+                timestamp,
+                encoded.SerializeToString(),
+                publish_time=timestamp,
+                sequence=sequence,
+            )
 
     @staticmethod
     def _check_signal_schemas(spec: dict[str, Any], summary: Summary) -> None:
