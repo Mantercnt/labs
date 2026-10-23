@@ -267,12 +267,12 @@ class AnnotationService:
                 "before another submission."
             ),
             "ingesting": (
-                "Nomadic could not finish processing the recording. Check its saved ingest reference "
+                "Nomadic could not finish processing the recording. Check its saved upload reference "
                 "before another submission."
             ),
             "indexing": (
-                "Robotics indexing did not confirm completion. Check Nomadic Workbench and the saved references "
-                "before another submission."
+                "Nomadic did not confirm that the action annotations are complete. "
+                "Check Nomadic Workbench and the saved references before another submission."
             ),
             "fetching": (
                 "The saved annotations could not be loaded. Use Refresh saved result to retry "

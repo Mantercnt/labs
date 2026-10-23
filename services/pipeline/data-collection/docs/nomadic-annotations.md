@@ -8,8 +8,8 @@ operator selects **Auto Annotate with Nomadic**.
 
 ## Setup
 
-The integration runs in the data-collection service. Keep the API key on that service; no Nomadic credential is needed
-by the browser.
+The integration runs in LABS' existing `data-collection` backend and adds controls to its `data-collection-ui` web
+interface. Keep the API key on the backend; no Nomadic credential is needed by the browser.
 
 For the FR3 Duo example station:
 
@@ -17,7 +17,7 @@ For the FR3 Duo example station:
    Keep the key out of version control.
 2. Use the existing station configuration and `config_contract_gr00t.yml`. The integration derives its recording mapping
    from this contract; a separate spec file is not needed for the reference setup.
-3. Run from the repository root:
+3. From a checkout containing the integration, run from the repository root:
 
 ```sh
 docker compose \
@@ -26,10 +26,17 @@ docker compose \
   up -d --build data-collection data-collection-ui
 ```
 
-The override builds the optional Nomadic dependencies, mounts the configuration directory read-only and uses the
-station's existing data mount. Builds default to the repository's `dev` target; `BUILD_TARGET` selects another target.
-The reference contract supplies camera and signal configuration. Review the mapping if the station changes its hardware
-or recording layout.
+The first Compose file supplies the normal station settings. The second adds the optional Nomadic dependencies, enables
+annotations and mounts the configuration directory read-only. It uses the station's existing data mount and does not add
+another service. Both the backend and UI are rebuilt with the integration code. The command recreates these services, so
+run it between recording sessions.
+
+Builds default to the repository's `dev` target; `BUILD_TARGET` selects another target. The reference contract supplies
+camera and signal configuration. Review the mapping if the station changes its hardware or recording layout.
+
+For another deployment, include the same build settings, environment variables and configuration mount in its deployment
+files. Setting `NOMADIC_ENABLED=true` at runtime enables annotations only when the optional dependencies are already
+installed in the backend image.
 
 ### Select a different configuration file
 
@@ -84,22 +91,23 @@ submissions.
 The settings below are read by the data-collection service. To change a setting that is not already referenced in
 `nomadic.compose.yml`, add it to that service's `environment` in a deployment override.
 
-| Variable                          | Default                           | When to override                                              |
-| --------------------------------- | --------------------------------- | ------------------------------------------------------------- |
-| `NOMADIC_ENABLED`                 | `false`                           | Enable annotations; the example override sets this to `true`. |
-| `NOMADIC_API_KEY`                 | Unset                             | Required Nomadic account credential.                          |
-| `NOMADIC_POLICY_CONTRACT_PATH`    | Unset; set by the Docker override | Existing LABS reference I/O contract.                         |
-| `NOMADIC_SPEC_PATH`               | Unset                             | Override with a spec for an already compatible recording.     |
-| `NOMADIC_FOLDER`                  | `Franka LABS`                     | Choose the destination folder in Nomadic.                     |
-| `NOMADIC_PROCESSED_EPISODES_PATH` | Existing LABS configuration       | Use a different processed recording directory.                |
-| `NOMADIC_STATE_PATH`              | Beside processed episodes         | Use a separate persistent state directory.                    |
-| `NOMADIC_BASE_URL`                | `https://api-prod.nomadicml.com`  | Connect to a different Nomadic API deployment.                |
-| `NOMADIC_DASHBOARD_URL`           | `https://app.nomadicml.com`       | Open Workbench in a different Nomadic deployment.             |
-| `NOMADIC_TIMEOUT_SECONDS`         | `3600`                            | Change the ingestion/indexing wait limit.                     |
-| `NOMADIC_MAX_PENDING_JOBS`        | `4`                               | Change the queue bound; one worker handles annotation jobs.   |
-| `NOMADIC_MAX_RECORDING_BYTES`     | `4294967296` (4 GiB)              | Change the accepted recording size.                           |
+| Variable                          | Default                           | When to override                                               |
+| --------------------------------- | --------------------------------- | -------------------------------------------------------------- |
+| `NOMADIC_ENABLED`                 | `false`                           | Enable annotations; the example override sets this to `true`.  |
+| `NOMADIC_API_KEY`                 | Unset                             | Required Nomadic account credential.                           |
+| `NOMADIC_POLICY_CONTRACT_PATH`    | Unset; set by the Docker override | Existing LABS reference I/O contract.                          |
+| `NOMADIC_SPEC_PATH`               | Unset                             | Override with a spec for an already compatible recording.      |
+| `NOMADIC_FOLDER`                  | `Franka LABS`                     | Choose the destination folder in Nomadic.                      |
+| `NOMADIC_PROCESSED_EPISODES_PATH` | Existing LABS configuration       | Use a different processed recording directory.                 |
+| `NOMADIC_STATE_PATH`              | Beside processed episodes         | Use a separate persistent state directory.                     |
+| `NOMADIC_BASE_URL`                | `https://api-prod.nomadicml.com`  | Connect to a different Nomadic API deployment.                 |
+| `NOMADIC_DASHBOARD_URL`           | `https://app.nomadicml.com`       | Open Workbench in a different Nomadic deployment.              |
+| `NOMADIC_TIMEOUT_SECONDS`         | `3600`                            | Change the wait limit for recording processing and annotation. |
+| `NOMADIC_MAX_PENDING_JOBS`        | `4`                               | Change the queue bound; one worker handles annotation jobs.    |
+| `NOMADIC_MAX_RECORDING_BYTES`     | `4294967296` (4 GiB)              | Change the accepted recording size.                            |
 
-The API key's Nomadic account must have access to MCAP ingestion and robotics indexing.
+The API key's Nomadic account must have access to MCAP uploads and robot action annotation. The SDK calls this
+annotation mode `index(..., mode="robotics")`.
 
 ## Use
 
@@ -110,9 +118,10 @@ The API key's Nomadic account must have access to MCAP ingestion and robotics in
 5. Review the action table, expand **Details**, download the annotations, or select **Open in Nomadic Workbench** for
    further review.
 
-The integration uploads a prepared copy and runs robotics indexing through the Nomadic SDK. Original recordings are
-retained unchanged. Results are saved on the station; refreshing or reopening the page does not submit another job. The
-local results are a snapshot of the completed analysis; subsequent edits in Nomadic are not automatically synchronized.
+The integration uploads a prepared copy and generates action annotations through the Nomadic SDK. Original recordings
+are retained unchanged. Results are saved on the station; refreshing or reopening the page does not submit another job.
+The local results are a snapshot of the completed analysis; subsequent edits in Nomadic are not automatically
+synchronized.
 
 Hand and Objects columns appear only when data is present. Every returned action class is shown as a tag. The JSON
 download includes the complete returned `structured_output`, including fields not displayed in the table. Missing fields
@@ -163,10 +172,10 @@ accuracy should also be reviewed against the intended annotation task.
 - **Mapping or preparation error:** check the recording and mapping. Failures before upload can be corrected and
   submitted again.
 - **Queue full:** wait for a running annotation to finish, then retry.
-- **Upload, ingestion or indexing interrupted:** inspect the saved references and Nomadic workspace before submitting
+- **Upload, processing or annotation interrupted:** inspect the saved references and Nomadic workspace before submitting
   again. The integration does not automatically repeat uploads or analyses after an uncertain outcome.
 - **Saved result could not be loaded:** use **Refresh saved result** when offered. This retrieves the existing analysis
-  without uploading or indexing again.
+  without uploading or analyzing again.
 - **Station restarted during annotation:** the job is marked interrupted. Known Nomadic identifiers are retained for
   inspection or retrieval.
 - **Storage unavailable:** check that the station's data directory is writable and persistent. Do not remove annotation

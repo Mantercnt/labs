@@ -177,10 +177,10 @@ export default function EpisodeAnnotations({ id, initialStatus }: { id: string; 
               <dl className='mt-2 grid gap-2 break-all'>
                 {(
                   [
-                    ['Ingest', job.ingest_id],
+                    ['Upload', job.ingest_id],
                     ['Video', job.video_id],
                     ['Batch', job.batch_id],
-                    ['Indexing run', job.index_run_id],
+                    ['Annotation run', job.index_run_id],
                     ['Analysis', job.analysis_id],
                   ] as const
                 )

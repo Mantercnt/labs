@@ -29,7 +29,7 @@ def status(episode_id: UUID, service: AnnotationService = Depends(get_annotation
 
 @router.post("", response_model=AnnotationJob, status_code=202)
 def start(episode_id: UUID, service: AnnotationService = Depends(get_annotation_service)) -> AnnotationJob:
-    """Explicitly send a saved episode to Nomadic for robotics indexing."""
+    """Submit a saved episode to Nomadic for action annotation."""
     try:
         return service.submit(episode_id)
     except FileNotFoundError as exc:
