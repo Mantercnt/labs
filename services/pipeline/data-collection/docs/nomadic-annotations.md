@@ -123,8 +123,8 @@ are left empty rather than inferred from descriptions.
 An episode must be saved and have the processor's `.processing_complete` marker. A single processed MCAP is required;
 raw recordings and multi-file stitching are not supported by this integration.
 
-LABS whole-video camera messages are converted to H.264 frames. For the reference station, camera clocks are anchored
-to the recorded capture stamps and aligned to the head camera's fixed playback rate. Short gaps repeat the nearest frame;
+LABS whole-video camera messages are converted to H.264 frames. For the reference station, camera clocks are anchored to
+the recorded capture stamps and aligned to the head camera's fixed playback rate. Short gaps repeat the nearest frame;
 the prepared spec records camera offsets and repeated frames. Long gaps, mismatched frame counts and non-increasing
 timestamps are rejected before upload. Existing supported compressed frames or images are preserved. Original sensor
 messages, metadata and attachments remain in the prepared copy.
@@ -146,11 +146,11 @@ the task instruction when present, taking precedence over embedded episode conte
 
 Each arm also has a derived flange pose from the nominal FR3 geometry. The adapter applies the arm-base transforms in
 `/tf_static` so both poses use the same recorded parent frame. Missing, conflicting or disconnected base transforms are
-rejected. These are not measured gripper TCP poses, and recorded transforms do not establish physical calibration.
-If both bases are recorded at the same position, the integration warns that the viewer shows nominal placement.
-A correctly positioned combined 3D view still requires station calibration. Recorded camera intrinsics are copied from
-`CameraInfo`; camera extrinsics are not inferred. Joint measurements remain available as signals, while trajectory
-parts use flange poses to avoid selecting an unrelated robot model in the viewer.
+rejected. These are not measured gripper TCP poses, and recorded transforms do not establish physical calibration. If
+both bases are recorded at the same position, the integration warns that the viewer shows nominal placement. A correctly
+positioned combined 3D view still requires station calibration. Recorded camera intrinsics are copied from `CameraInfo`;
+camera extrinsics are not inferred. Joint measurements remain available as signals, while trajectory parts use flange
+poses to avoid selecting an unrelated robot model in the viewer.
 
 Unsupported contract layouts, missing channels, ambiguous joint names and invalid measurements fail before upload.
 Verify the resulting camera views and trajectory on a representative station recording. Action definitions and boundary

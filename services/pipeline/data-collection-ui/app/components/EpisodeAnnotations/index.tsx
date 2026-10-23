@@ -83,7 +83,7 @@ export default function EpisodeAnnotations({ id, initialStatus }: { id: string; 
           </Button>
         </fetcher.Form>
       )}
-      {fetcher.data?.error && (
+      {fetcher.data?.error && !active && job?.state !== 'completed' && (
         <p className='text' role='alert'>
           {fetcher.data.error}
         </p>
