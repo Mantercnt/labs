@@ -54,11 +54,15 @@ export default function EpisodeAnnotations({ id, initialStatus }: { id: string; 
   if (!status.enabled) return null
 
   return (
-    <section aria-labelledby='annotations-title' className='flex flex-col gap-4'>
-      <h2 id='annotations-title' className='text-xl font-medium'>
+    <section aria-labelledby='annotations-title' className='flex flex-col gap-3'>
+      <h2 id='annotations-title' className='header'>
         Action annotations
       </h2>
-      <p className='text max-w-[80ch]'>Analyze this saved recording with Nomadic to find timestamped robot actions.</p>
+      {job?.state !== 'completed' && (
+        <p className='text max-w-[80ch]'>
+          Analyze this saved recording with Nomadic to find timestamped robot actions.
+        </p>
+      )}
       {status.message && (
         <p className='text' role='status'>
           {status.message}
@@ -96,74 +100,77 @@ export default function EpisodeAnnotations({ id, initialStatus }: { id: string; 
               ))}
             </ul>
           )}
-          {job.viewer_url && (
-            <a className='text keyboard-focus w-fit underline' href={job.viewer_url} target='_blank' rel='noreferrer'>
-              Open in Nomadic Workbench
-            </a>
-          )}
-          {job.state === 'completed' && (
-            <>
-              <a
-                className='text keyboard-focus flex w-fit items-center gap-2 underline'
-                href={`${endpoint}&download=1`}
-              >
-                <Download aria-hidden className='h-4 w-4' /> Download annotations
-              </a>
-              {job.events.length > 0 ? (
-                <div className='overflow-x-auto'>
-                  <table className='text w-full border-collapse text-left'>
-                    <caption className='pb-3 text-left'>Times are seconds from the recording start.</caption>
-                    <thead>
-                      <tr>
-                        {[
-                          'Start',
-                          'End',
-                          'Action',
-                          ...(showHand ? ['Hand'] : []),
-                          ...(showObjects ? ['Objects'] : []),
-                        ].map((label) => (
-                          <th key={label} scope='col' className='border-b p-2'>
-                            {label}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {job.events.map((event) => (
-                        <tr key={event.event_id}>
-                          <td className='p-2 tabular-nums'>{event.start_seconds.toFixed(3)}</td>
-                          <td className='p-2 tabular-nums'>{event.end_seconds.toFixed(3)}</td>
-                          <td className='p-2'>
-                            <p>{event.description}</p>
-                            <div className='mt-2 flex flex-wrap gap-1'>
-                              {(event.action_classes?.length
-                                ? event.action_classes
-                                : event.category
-                                  ? [event.category]
-                                  : []
-                              ).map((category) => (
-                                <span
-                                  key={category}
-                                  className='border-pastel-grey-300 bg-pastel-grey-100 inline-block rounded-sm border px-2 py-1 text-xs font-medium'
-                                >
-                                  {category}
-                                </span>
-                              ))}
-                            </div>
-                            <ActionDetails event={event} />
-                          </td>
-                          {showHand && <td className='p-2'>{event.acting_hand ?? 'Unknown'}</td>}
-                          {showObjects && <td className='p-2'>{event.objects.join(', ') || '—'}</td>}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              ) : (
-                <p className='text'>No action windows were returned for this recording.</p>
+          {(job.viewer_url || job.state === 'completed') && (
+            <div className='flex flex-wrap items-center gap-x-5 gap-y-2'>
+              {job.viewer_url && (
+                <a className='text keyboard-focus underline' href={job.viewer_url} target='_blank' rel='noreferrer'>
+                  Open in Nomadic Workbench
+                </a>
               )}
-            </>
+              {job.state === 'completed' && (
+                <a
+                  className='text keyboard-focus inline-flex items-center gap-2 underline'
+                  href={`${endpoint}&download=1`}
+                >
+                  <Download aria-hidden className='h-4 w-4' /> Download annotations
+                </a>
+              )}
+            </div>
           )}
+          {job.state === 'completed' &&
+            (job.events.length > 0 ? (
+              <div className='overflow-x-auto'>
+                <table className='text w-full border-collapse text-left'>
+                  <caption className='pb-3 text-left'>Times are seconds from the recording start.</caption>
+                  <thead>
+                    <tr>
+                      {[
+                        'Start',
+                        'End',
+                        'Action',
+                        ...(showHand ? ['Hand'] : []),
+                        ...(showObjects ? ['Objects'] : []),
+                      ].map((label) => (
+                        <th key={label} scope='col' className='border-pastel-grey-300 border-b p-2'>
+                          {label}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className='divide-pastel-grey-300 divide-y'>
+                    {job.events.map((event) => (
+                      <tr key={event.event_id}>
+                        <td className='p-2 align-top tabular-nums'>{event.start_seconds.toFixed(3)}</td>
+                        <td className='p-2 align-top tabular-nums'>{event.end_seconds.toFixed(3)}</td>
+                        <td className='p-2 align-top'>
+                          <p>{event.description}</p>
+                          <div className='mt-2 flex flex-wrap gap-1'>
+                            {(event.action_classes?.length
+                              ? event.action_classes
+                              : event.category
+                                ? [event.category]
+                                : []
+                            ).map((category) => (
+                              <span
+                                key={category}
+                                className='border-pastel-grey-300 bg-pastel-grey-100 inline-block rounded-sm border px-2 py-1 text-xs font-medium'
+                              >
+                                {category}
+                              </span>
+                            ))}
+                          </div>
+                          <ActionDetails event={event} />
+                        </td>
+                        {showHand && <td className='p-2 align-top'>{event.acting_hand ?? 'Unknown'}</td>}
+                        {showObjects && <td className='p-2 align-top'>{event.objects.join(', ') || '—'}</td>}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className='text'>No action windows were returned for this recording.</p>
+            ))}
           {(job.ingest_id || job.video_id || job.index_run_id) && (
             <details className='text'>
               <summary className='keyboard-focus cursor-pointer'>Nomadic references</summary>
