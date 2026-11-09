@@ -2,6 +2,7 @@
 
 import math
 import re
+import time
 from http import HTTPStatus
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
@@ -10,7 +11,10 @@ import nomadic  # type: ignore[import-untyped]
 
 from configs.annotator import AnnotationConfig
 from jobs.models import AnnotationEvent
-from jobs.ports import AccountCheck, BillingDeclinedError, IndexResult, InvalidApiKeyError
+from jobs.ports import AccountCheck, BillingDeclinedError, IndexResult, InvalidApiKeyError, RemoteFailedError
+
+# Seconds between checks on a started indexing run.
+POLL_SECONDS = 10
 
 
 class NomadicGateway:
@@ -50,13 +54,19 @@ class NomadicGateway:
             dict(self.client.video.wait_for_mcap_ingest(ingest_id, timeout=self.config.timeout_seconds))
         )
 
-    def index(self, video_id: str) -> IndexResult:
-        """Run robotics indexing for the primary camera view."""
+    def start_index(self, video_id: str) -> IndexResult:
+        """Start robotics indexing for the primary camera view and return its run before it finishes.
+
+        The SDK waits for indexing to finish. A short wait makes it return the run reference instead, which the job
+        saves, so a restarted station follows the same run rather than starting and paying for another.
+        """
         try:
-            results = self.client.index([video_id], mode="robotics", timeout=self.config.timeout_seconds)
+            results = self.client.index([video_id], mode="robotics", timeout=1, poll_interval=1)
         except nomadic.APIError as exc:
             raise billing_declined(exc) or exc from None
         result = dict(results[video_id])
+        if result.get("status") == "failed" and result.get("error_code") != "timeout":
+            raise RemoteFailedError("Nomadic could not start the annotation.")
         return IndexResult(
             completed=result.get("status") == "completed",
             batch_id=result.get("batch_id"),
@@ -65,6 +75,38 @@ class NomadicGateway:
             video_id=result.get("index_video_id"),
             has_warnings=bool(result.get("warnings")),
         )
+
+    def wait_index(self, video_id: str, run_id: str) -> IndexResult:
+        """Follow a started run until its analysis completes or fails, or the wait limit passes."""
+        deadline = time.monotonic() + self.config.timeout_seconds
+        while True:
+            batch = dict(self.client.get_batch_analysis(run_id))
+            row = next((row for row in batch.get("results", []) if row.get("video_id") == video_id), None)
+            if row is None:
+                raise RemoteFailedError("The recording is not part of the Nomadic annotation run.")
+            analysis_id = row.get("analysis_id")
+            if analysis_id:
+                payload = dict(self.client.video.get_video_analysis(video_id, analysis_id))
+                analysis = payload.get("analysis") or payload
+                status = str(analysis.get("status", "")).lower()
+                if status in {"completed", "complete"}:
+                    stages = analysis.get("indexing_status") or {}
+                    return IndexResult(
+                        completed=True,
+                        batch_id=run_id,
+                        run_id=run_id,
+                        analysis_id=analysis_id,
+                        has_warnings=any(
+                            isinstance(stage, dict) and stage.get("status") == "warning" for stage in stages.values()
+                        ),
+                    )
+                if status == "failed":
+                    raise RemoteFailedError("Nomadic could not annotate the recording.")
+            elif str(row.get("status", "")).lower() in {"failed", "cancelled"}:
+                raise RemoteFailedError("Nomadic could not annotate the recording.")
+            if time.monotonic() >= deadline:
+                return IndexResult(completed=False, run_id=run_id, analysis_id=analysis_id)
+            time.sleep(POLL_SECONDS)
 
     def analysis_id(self, batch_id: str, video_id: str) -> str | None:
         """Resolve a saved analysis pointer without creating another indexing job."""
@@ -109,6 +151,8 @@ def verify_api_key(config: AnnotationConfig, api_key: str) -> AccountCheck:
 
 def primary_video(payload: dict[str, Any]) -> str:
     """Resolve the declared primary view, accepting a sole video for single-view recordings."""
+    if payload.get("status") == "failed":
+        raise RemoteFailedError("Nomadic could not process the recording.")
     if payload.get("status") != "completed":
         raise ValueError("Nomadic did not ingest the complete recording.")
     primary = payload.get("primary_view_id") or (payload.get("videos_by_role") or {}).get("front")

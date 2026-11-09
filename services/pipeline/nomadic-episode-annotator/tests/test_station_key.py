@@ -109,6 +109,20 @@ def test_unreachable_nomadic_does_not_leak_the_key(config: AnnotationConfig) -> 
     assert not (config.state_path / "station_key.json").exists()
 
 
+def test_key_is_forgotten_when_the_worker_cannot_start(
+    config: AnnotationConfig, services: list[AnnotationService], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = AnnotationService(config, Mock(), verifier(AccountCheck(email="operator@lab.example")))
+    services.append(service)
+    monkeypatch.setattr(service, "start", Mock(side_effect=AnnotationUnavailableError("storage")))
+    with pytest.raises(AnnotationUnavailableError):
+        service.connect(KEY)
+    assert not (config.state_path / "station_key.json").exists()
+    assert not config.api_key.get_secret_value() and service.account is None
+    monkeypatch.undo()
+    assert service.connect(KEY).email == "operator@lab.example"
+
+
 def test_connected_station_keeps_its_key(config: AnnotationConfig) -> None:
     configured = config.model_copy(update={"api_key": SecretStr("administrator-key")})
     check = verifier(AccountCheck(email="other@lab.example"))

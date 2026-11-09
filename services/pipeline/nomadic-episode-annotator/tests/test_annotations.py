@@ -31,7 +31,7 @@ from dependencies import get_annotation_service
 from handlers.annotations import router
 from jobs.episodes import recording_path
 from jobs.models import AnnotationEvent, AnnotationJob
-from jobs.ports import IndexResult
+from jobs.ports import IndexResult, RemoteFailedError
 from jobs.service import AnnotationConflictError, AnnotationService, AnnotationUnavailableError
 from jobs.store import JobStore
 from jobs.workbench import workbench_url
@@ -340,10 +340,14 @@ class FakeGateway:
         assert ingest_id == "ingest-1"
         return "main-view"
 
-    def index(self, video_id: str) -> IndexResult:
+    def start_index(self, video_id: str) -> IndexResult:
         self.calls.append("index")
         assert video_id == "main-view"
-        return IndexResult(completed=True, batch_id="batch-1", analysis_id="analysis-1")
+        return IndexResult(completed=False, run_id="run-1")
+
+    def wait_index(self, video_id: str, run_id: str) -> IndexResult:
+        assert (video_id, run_id) == ("main-view", "run-1")
+        return IndexResult(completed=True, batch_id="batch-1", run_id=run_id, analysis_id="analysis-1")
 
     def analysis_id(self, batch_id: str, video_id: str) -> str | None:
         return "analysis-1" if (batch_id, video_id) == ("batch-1", "main-view") else None
@@ -417,7 +421,7 @@ def test_disabled_service_never_initializes_storage_or_sdk(tmp_path: Path) -> No
     assert not service.config.state_path.exists()
 
 
-def test_recovery_retains_remote_ids_and_blocks_duplicate_upload(config: AnnotationConfig) -> None:
+def test_restart_during_annotation_continues_the_same_run(config: AnnotationConfig) -> None:
     episode, _ = saved_episode(config)
     store = JobStore(config.state_path)
     interrupted = AnnotationJob(
@@ -427,14 +431,43 @@ def test_recovery_retains_remote_ids_and_blocks_duplicate_upload(config: Annotat
         remote_started=True,
         video_id="main-view",
         ingest_id="ingest-1",
+        index_run_id="run-1",
     )
     store.save(interrupted)
+    FakeGateway.calls = []
     service = started(AnnotationService(config, FakeGateway))
     try:
-        job = service.status(episode).job
-        assert job.state == "interrupted" and job.video_id == "main-view"
+        status = service.status(episode)
+        assert status.job.state == "interrupted" and status.can_resume and not status.can_submit
         with pytest.raises(AnnotationConflictError, match="remote work"):
             service.submit(episode)
+        service.refresh(episode)
+        assert wait_for_job(service, episode, "completed").analysis_id == "analysis-1"
+        assert FakeGateway.calls == []
+    finally:
+        service.close()
+
+
+def test_restart_before_the_run_was_saved_can_start_again(config: AnnotationConfig) -> None:
+    episode, _ = saved_episode(config)
+    store = JobStore(config.state_path)
+    store.save(
+        AnnotationJob(
+            job_id=uuid7.create(),
+            episode_id=episode,
+            state="uploading",
+            remote_started=True,
+        )
+    )
+    FakeGateway.calls = []
+    FakeGateway.finish.set()
+    service = started(AnnotationService(config, FakeGateway))
+    try:
+        status = service.status(episode)
+        assert status.job.state == "interrupted" and status.can_submit and not status.can_resume
+        service.submit(episode)
+        wait_for_job(service, episode, "completed")
+        assert FakeGateway.calls == ["upload", "index"]
     finally:
         service.close()
 
@@ -452,7 +485,7 @@ def test_worker_ownership_is_exclusive(config: AnnotationConfig) -> None:
 
 def test_remote_failure_is_redacted_and_cannot_duplicate_submission(config: AnnotationConfig) -> None:
     class FailingGateway(FakeGateway):
-        def index(self, video_id: str) -> IndexResult:
+        def wait_index(self, video_id: str, run_id: str) -> IndexResult:
             raise RuntimeError(f"Authorization: {config.api_key.get_secret_value()}")
 
     episode, _ = saved_episode(config)
@@ -526,7 +559,7 @@ def test_existing_sdk_sends_robotics_mode(config: AnnotationConfig, monkeypatch:
     )
     monkeypatch.setattr(gateway.client, "_make_request", transport)
     try:
-        result = gateway.index("main")
+        result = gateway.start_index("main")
         assert result.completed and result.analysis_id == "a1"
         assert transport.call_args_list[0].args == ("POST", "/api/videos/index")
         assert transport.call_args_list[0].kwargs["json_data"] == {"video_ids": ["main"], "mode": "robotics"}
@@ -624,17 +657,68 @@ def test_ingest_resolves_the_primary_view(config: AnnotationConfig, monkeypatch:
     assert gateway.ingest("ingest-1") == "main-view"
 
 
-def test_incomplete_index_keeps_its_remote_references(
+def test_started_index_returns_its_run_before_finishing(
     config: AnnotationConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    payload = {"status": "failed", "batch_id": "b1", "run_id": "r1", "analysis_id": "a1", "index_video_id": "v2"}
-    result = sdk_gateway(monkeypatch, config, index={"main": payload}).index("main")
-    assert result == IndexResult(completed=False, batch_id="b1", run_id="r1", analysis_id="a1", video_id="v2")
+    payload = {"status": "failed", "error_code": "timeout", "run_id": "r1", "index_video_id": "v2"}
+    gateway = sdk_gateway(monkeypatch, config, index={"main": payload})
+    assert gateway.start_index("main") == IndexResult(completed=False, run_id="r1", video_id="v2")
+    assert gateway.client.index.call_args.kwargs["timeout"] == 1
+    refused = sdk_gateway(monkeypatch, config, index={"main": {"status": "failed", "error": "access denied"}})
+    with pytest.raises(RemoteFailedError):
+        refused.start_index("main")
 
 
 def test_index_warnings_are_reported(config: AnnotationConfig, monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {"status": "completed", "warnings": ["missing evidence"]}
-    assert sdk_gateway(monkeypatch, config, index={"main": payload}).index("main").has_warnings
+    assert sdk_gateway(monkeypatch, config, index={"main": payload}).start_index("main").has_warnings
+
+
+def test_waiting_follows_the_saved_run_until_its_analysis_completes(
+    config: AnnotationConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("adapters.nomadic_gateway.POLL_SECONDS", 0)
+    pending = {"results": [{"video_id": "main", "analysis_id": None, "status": "processing"}]}
+    linked = {"results": [{"video_id": "other", "analysis_id": "a0"}, {"video_id": "main", "analysis_id": "a1"}]}
+    gateway = sdk_gateway(monkeypatch, config)
+    gateway.client.get_batch_analysis = Mock(side_effect=[pending, linked, linked])
+    gateway.client.video.get_video_analysis = Mock(
+        side_effect=[
+            {"analysis": {"status": "processing"}},
+            {"analysis": {"status": "completed", "indexing_status": {"objects": {"status": "warning"}}}},
+        ]
+    )
+    result = gateway.wait_index("main", "run-1")
+    assert result == IndexResult(completed=True, batch_id="run-1", run_id="run-1", analysis_id="a1", has_warnings=True)
+    gateway.client.get_batch_analysis.assert_called_with("run-1")
+
+
+@pytest.mark.parametrize(
+    "batch",
+    [
+        {"results": [{"video_id": "main", "analysis_id": None, "status": "failed"}]},
+        {"results": [{"video_id": "other", "analysis_id": "a0"}]},
+    ],
+)
+def test_waiting_reports_a_run_nomadic_failed(
+    config: AnnotationConfig, monkeypatch: pytest.MonkeyPatch, batch: dict[str, Any]
+) -> None:
+    with pytest.raises(RemoteFailedError):
+        sdk_gateway(monkeypatch, config, batch=batch).wait_index("main", "run-1")
+
+
+def test_waiting_stops_at_the_limit_and_keeps_the_run(
+    config: AnnotationConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config.timeout_seconds = 0
+    pending = {"results": [{"video_id": "main", "analysis_id": "a1"}]}
+    gateway = sdk_gateway(monkeypatch, config, batch=pending, analysis={"analysis": {"status": "processing"}})
+    assert gateway.wait_index("main", "run-1") == IndexResult(completed=False, run_id="run-1", analysis_id="a1")
+
+
+def test_failed_processing_is_reported_as_finished() -> None:
+    with pytest.raises(RemoteFailedError, match="could not process"):
+        primary_video({"status": "failed"})
 
 
 def test_batch_lookup_selects_this_recordings_analysis(
@@ -728,7 +812,7 @@ def test_failures_are_actionable_and_do_not_leak_credentials(
         "connecting": "__init__",
         "uploading": "upload",
         "ingesting": "ingest",
-        "indexing": "index",
+        "indexing": "wait_index",
         "fetching": "events",
     }[phase]
     monkeypatch.setattr(BrokenGateway, method, fail)
@@ -741,10 +825,14 @@ def test_failures_are_actionable_and_do_not_leak_credentials(
         job = wait_for_job(service, episode, "failed" if phase == "connecting" else "interrupted")
         assert config.api_key.get_secret_value() not in job.model_dump_json()
         assert config.api_key.get_secret_value() not in caplog.text
-        assert "Check" in job.message or "Refresh saved result" in job.message
+        assert any(action in job.message for action in ("Check", "Continue", "Refresh saved result"))
         if phase == "connecting":
             assert not job.remote_started and FakeGateway.calls == []
+        if phase in {"connecting", "uploading"}:
+            # No reference to continue: the operator can start again.
+            assert service.status(episode).can_submit
         else:
+            assert service.status(episode).can_resume
             with pytest.raises(AnnotationConflictError):
                 service.submit(episode)
         if phase in {"ingesting", "indexing", "fetching"}:
@@ -757,8 +845,8 @@ def test_failures_are_actionable_and_do_not_leak_credentials(
 
 def test_partial_index_result_can_be_refreshed_without_resubmission(config: AnnotationConfig) -> None:
     class PendingGateway(FakeGateway):
-        def index(self, video_id: str) -> IndexResult:
-            return replace(super().index(video_id), completed=False)
+        def wait_index(self, video_id: str, run_id: str) -> IndexResult:
+            return replace(super().wait_index(video_id, run_id), completed=False)
 
     episode, _ = saved_episode(config)
     FakeGateway.calls = []
@@ -775,23 +863,49 @@ def test_partial_index_result_can_be_refreshed_without_resubmission(config: Anno
         service.close()
 
 
-def test_timeout_run_reference_is_not_treated_as_a_batch(config: AnnotationConfig) -> None:
-    class TimedOutGateway(FakeGateway):
-        def index(self, video_id: str) -> IndexResult:
-            return IndexResult(completed=False, run_id="index-run-1")
+def test_timed_out_annotation_continues_the_same_run(config: AnnotationConfig) -> None:
+    class SlowGateway(FakeGateway):
+        waits: ClassVar[int] = 0
+
+        def wait_index(self, video_id: str, run_id: str) -> IndexResult:
+            type(self).waits += 1
+            if type(self).waits == 1:
+                return IndexResult(completed=False, run_id=run_id)
+            return super().wait_index(video_id, run_id)
 
     episode, _ = saved_episode(config)
+    FakeGateway.calls = []
     FakeGateway.finish.set()
-    service = started(AnnotationService(config, TimedOutGateway))
+    service = started(AnnotationService(config, SlowGateway))
     try:
         service.submit(episode)
         job = wait_for_job(service, episode, "interrupted")
-        assert job.index_run_id == "index-run-1" and job.batch_id is None
-        with pytest.raises(AnnotationConflictError, match="No remote analysis reference"):
-            service.refresh(episode)
+        assert job.index_run_id == "run-1" and job.batch_id is None
         status = service.status(episode)
-        assert not status.can_submit and status.job.viewer_url is not None
-        assert "/workbench/videos/" in status.job.viewer_url
+        assert status.can_resume and not status.can_submit
+        assert "/workbench/videos/" in (status.job.viewer_url or "")
+        service.refresh(episode)
+        assert wait_for_job(service, episode, "completed").batch_id == "batch-1"
+        assert FakeGateway.calls == ["upload", "index"]
+    finally:
+        service.close()
+
+
+def test_annotation_nomadic_reports_failed_can_be_started_again(config: AnnotationConfig) -> None:
+    class FailedRun(FakeGateway):
+        def wait_index(self, video_id: str, run_id: str) -> IndexResult:
+            raise RemoteFailedError("Nomadic could not annotate the recording.")
+
+    episode, _ = saved_episode(config)
+    FakeGateway.finish.set()
+    service = started(AnnotationService(config, FailedRun))
+    try:
+        service.submit(episode)
+        job = wait_for_job(service, episode, "failed")
+        assert job.remote_started and job.index_run_id == "run-1"
+        assert "Start the annotation again" in job.message
+        status = service.status(episode)
+        assert status.can_submit and not status.can_resume
     finally:
         service.close()
 
@@ -888,7 +1002,8 @@ def test_shutdown_keeps_the_storage_lock_while_a_follower_can_still_write(config
     service.submit(episode)
     wait_for_uploads(1)
     service.close()
-    assert service.status(episode).job.state == "interrupted"
+    # Shutdown leaves the follower's references alone; it or the next start marks the job interrupted.
+    assert service.status(episode).job.state == "ingesting"
     with pytest.raises(AnnotationConflictError, match="owns this storage directory"):
         AnnotationService(config, SlowNomadicGateway).start()
     SlowNomadicGateway.processing.set()

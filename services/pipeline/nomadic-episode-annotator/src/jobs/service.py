@@ -15,7 +15,15 @@ from configs.annotator import AnnotationConfig
 from jobs import station_key
 from jobs.episodes import recording_path
 from jobs.models import ACTIVE_STATES, AnnotationJob, AnnotationStatus, StationAccount, StationSetup
-from jobs.ports import AnnotationGateway, BillingDeclinedError, GatewayFactory, InvalidApiKeyError, KeyVerifier
+from jobs.ports import (
+    AnnotationGateway,
+    BillingDeclinedError,
+    GatewayFactory,
+    IndexResult,
+    InvalidApiKeyError,
+    KeyVerifier,
+    RemoteFailedError,
+)
 from jobs.store import JobStore, JobStoreError
 from jobs.workbench import api_keys_url, billing_url, signup_url, workbench_url
 from recording_conversion.preparation import RecordingPreparer
@@ -162,18 +170,31 @@ class AnnotationService:
             raise AnnotationUnavailableError(
                 "Nomadic could not be reached to check the key. Check the station's internet connection and try again."
             ) from None
+        return self._save_and_start(api_key, check.email)
+
+    def _save_and_start(self, api_key: str, email: str | None) -> StationAccount:
+        """Save a verified key and start the worker, leaving the station unconnected if the worker cannot start."""
         with self._guard:
             if self.config.api_key.get_secret_value():
                 raise AnnotationConflictError(_ALREADY_CONNECTED)
             try:
-                station_key.save(self.config.state_path, api_key, check.email)
+                station_key.save(self.config.state_path, api_key, email)
             except OSError as exc:
                 raise AnnotationUnavailableError(
                     "The key could not be saved. Check the station's data directory."
                 ) from exc
             self.config.api_key = SecretStr(api_key)
-            self.account = StationAccount(email=check.email)
-        self.start()
+            self.account = StationAccount(email=email)
+        try:
+            self.start()
+        except Exception:
+            # Leave the station unconnected, so the operator can connect again once the cause is fixed.
+            with self._guard:
+                self.config.api_key = SecretStr("")
+                self.account = None
+                with suppress(OSError):
+                    station_key.remove(self.config.state_path)
+            raise
         return self.account
 
     def _load_station_key(self) -> None:
@@ -212,12 +233,14 @@ class AnnotationService:
             message="",
             job=job,
             account=self.account,
-            can_resume=bool(job and job.state not in ACTIVE_STATES and self._resumable(job)),
+            can_resume=bool(job and self._resumable(job)),
             billing_url=self._billing_url(),
         )
         if job and job.video_id:
             job.viewer_url = workbench_url(self.config.dashboard_url, job.batch_id, job.video_id)
-        if job and (job.state in ACTIVE_STATES or job.remote_started or job.state == "completed"):
+        if job and job.remote_started and not self._restartable(job):
+            return status
+        if job and (job.state in ACTIVE_STATES or job.state == "completed"):
             return status
         try:
             self._source(episode_id)
@@ -238,9 +261,11 @@ class AnnotationService:
             previous = store.latest(episode_id)
             if previous and previous.state in ACTIVE_STATES:
                 return previous
-            if previous and (previous.remote_started or previous.state == "completed"):
+            if previous and (
+                previous.state == "completed" or (previous.remote_started and not self._restartable(previous))
+            ):
                 raise AnnotationConflictError(
-                    "This episode already has remote work. Inspect its saved result before resubmitting."
+                    "This episode already has remote work. Continue it or inspect its saved result instead."
                 )
             if self._queue.full():
                 raise AnnotationConflictError("The annotation queue is full. Try again after the current jobs finish.")
@@ -268,10 +293,10 @@ class AnnotationService:
             raise AnnotationConflictError(reason)
         with self._guard:
             job = self._running_store().latest(episode_id)
+            if job and (job.state in ACTIVE_STATES or job.state == "completed"):
+                return job
             if not job or not self._resumable(job):
                 raise AnnotationConflictError("No remote analysis reference is available to refresh.")
-            if job.state in ACTIVE_STATES or job.state == "completed":
-                return job
             if self._queue.full() or self._stop.is_set():
                 raise AnnotationConflictError("The annotation worker is busy or stopping.")
             job.state, job.message, job.billing = "queued", "Waiting to continue with the saved upload.", None
@@ -281,18 +306,28 @@ class AnnotationService:
 
     @staticmethod
     def _resumable(job: AnnotationJob) -> bool:
-        """Whether retrying can continue the saved remote work without starting a second analysis.
+        """Whether continuing can pick up the saved remote work without starting a second analysis.
 
-        A saved analysis or batch is only fetched. An upload whose ingest result was never received is waited on again.
-        A recording is indexed again only when Nomadic declined the first request for credits, so no analysis exists.
+        A saved analysis or batch is only fetched, and a saved annotation run or upload is waited on again. A recording
+        is indexed again only when Nomadic declined the first request for credits, so no analysis exists.
         """
-        if not job.remote_started or job.state == "completed":
+        if job.state != "interrupted" or not job.remote_started:
             return False
-        if job.analysis_id or job.batch_id:
+        if job.analysis_id or job.batch_id or job.index_run_id:
             return bool(job.video_id)
         if job.ingest_id and not job.video_id:
             return True
         return bool(job.video_id) and job.billing == "out_of_credits"
+
+    @classmethod
+    def _restartable(cls, job: AnnotationJob) -> bool:
+        """Whether the episode may be submitted again: nothing is left to continue, so every stop has a way out.
+
+        This holds when the job failed, including when Nomadic reported that its processing or annotation failed, and
+        when an interrupted job has no saved reference to continue, such as an upload or an annotation start whose
+        answer was lost. Starting again uploads the recording again.
+        """
+        return job.state == "failed" or (job.state == "interrupted" and not cls._resumable(job))
 
     def _fetch(self, job: AnnotationJob, gateway: AnnotationGateway) -> None:
         if job.video_id is None:
@@ -322,12 +357,13 @@ class AnnotationService:
                 self._fetch(job, gateway)
                 return
             if job.remote_started:
-                # Continue the saved upload: wait for its processing again, or analyze it after a credit refusal.
-                stage = "ingesting" if job.video_id is None else "indexing"
+                # Continue the saved upload: wait for its processing or annotation run again, or annotate it after a
+                # credit refusal.
+                job.state = "ingesting" if job.video_id is None else "indexing"
+                stage = job.state
                 self._reserve_follower()
                 reserved = True
                 gateway = self.gateway_factory(self.config)
-                job.state = stage
                 job.message = (
                     "Nomadic is processing the recording." if stage == "ingesting" else "Analyzing robotic actions."
                 )
@@ -404,7 +440,10 @@ class AnnotationService:
             if stage == "uploading":
                 # Nomadic refused the upload, so nothing was sent and the episode can be submitted again.
                 job.remote_started = False
-        job.state = "interrupted" if job.remote_started else "failed"
+        # Nomadic reporting a failure ends the remote work, so the episode can be started again.
+        job.state = "interrupted" if job.remote_started and not isinstance(exc, RemoteFailedError) else "failed"
+        if stage == "indexing" and not job.index_run_id and not isinstance(exc, BillingDeclinedError):
+            stage = "starting"
         # SDK exceptions may contain request details. Do not persist or log them.
         job.message = self._failure_message(stage, exc)
         logger.warning("Annotation job %s stopped during processing (%s)", job.job_id, type(exc).__name__)
@@ -423,24 +462,37 @@ class AnnotationService:
                 logger.warning("Could not close the Nomadic session for job %s", job.job_id)
 
     def _index(self, job: AnnotationJob, gateway: AnnotationGateway) -> None:
-        """Save returned references before checking whether indexing completed."""
+        """Save the run reference as soon as indexing starts, then wait for that run, never starting a second one."""
         if job.video_id is None:
             raise ValueError("The Nomadic video identifier is missing.")
-        result = gateway.index(job.video_id)
-        job.batch_id = result.batch_id
-        job.index_run_id = result.run_id
-        job.analysis_id = result.analysis_id
-        job.video_id = result.video_id or job.video_id
-        self._save(job)
+        if job.index_run_id is None:
+            result = gateway.start_index(job.video_id)
+            self._keep_index_references(job, result)
+            if not result.completed:
+                if job.index_run_id is None:
+                    raise ValueError("Nomadic did not return a reference for the annotation run.")
+                result = gateway.wait_index(job.video_id, job.index_run_id)
+        else:
+            result = gateway.wait_index(job.video_id, job.index_run_id)
+        self._keep_index_references(job, result)
         if not result.completed:
             raise ValueError("Indexing has not completed.")
         if result.has_warnings:
             job.warnings.append("Some supporting evidence was unavailable; review the Nomadic analysis.")
 
+    def _keep_index_references(self, job: AnnotationJob, result: IndexResult) -> None:
+        job.batch_id = result.batch_id or job.batch_id
+        job.index_run_id = result.run_id or job.index_run_id
+        job.analysis_id = result.analysis_id or job.analysis_id
+        job.video_id = result.video_id or job.video_id
+        self._save(job)
+
     def _failure_message(self, stage: str, exc: Exception) -> str:
         """Give an actionable stage-specific message without exposing SDK request details."""
         if isinstance(exc, BillingDeclinedError):
             return _billing_message(exc, uploaded=stage != "uploading")
+        if isinstance(exc, RemoteFailedError):
+            return f"{exc} Start the annotation again."
         if stage == "preparing" and isinstance(exc, FileNotFoundError | ValueError):
             message = str(exc)
             secret = self.config.api_key.get_secret_value()
@@ -454,16 +506,19 @@ class AnnotationService:
                 "Nothing was uploaded."
             ),
             "uploading": (
-                "The upload could not be confirmed. Check the API key, connectivity and Nomadic workspace "
-                "before another submission."
+                "The upload could not be confirmed. Check the station's connection, then start the annotation again."
             ),
             "ingesting": (
-                "Nomadic could not finish processing the recording. Check its saved upload reference "
-                "before another submission."
+                "Nomadic did not confirm that it processed the recording. Continue with the saved upload to wait "
+                "for it again, or start the annotation again."
+            ),
+            "starting": (
+                "Nomadic did not confirm that the annotation started. Check Nomadic Workbench; if the recording "
+                "has no analysis there, start the annotation again."
             ),
             "indexing": (
-                "Nomadic did not confirm that the action annotations are complete. "
-                "Check Nomadic Workbench and the saved references before another submission."
+                "Nomadic did not confirm that the action annotations are complete. Continue to wait for the same "
+                "annotation run; it is not started again."
             ),
             "fetching": (
                 "The saved annotations could not be loaded. Use Refresh saved result to retry "
@@ -499,9 +554,8 @@ class AnnotationService:
             followers = list(self._followers)
         for follower in followers:
             follower.join(timeout=1)
-        if self.store:
-            with suppress(JobStoreError, ValueError):
-                self.store.recover()
+        # The next start() marks unfinished jobs interrupted. Doing it here could overwrite references that a
+        # follower still running its last SDK call saves after the join timeout.
         # A still-running SDK call retains the lock until process exit. A new
         # process must not claim ownership while this worker or a follower can still write.
         threads = [self._worker, *followers]

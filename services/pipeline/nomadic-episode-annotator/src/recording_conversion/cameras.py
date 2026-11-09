@@ -61,42 +61,60 @@ def _capture_times(source: Path, boundaries: dict[str, Any], topics: set[str]) -
 
 def alignment_plan(
     source: Path, boundaries: dict[str, Any], views: list[dict[str, Any]], primary: str
-) -> dict[str, CameraPlan]:
-    """Estimate camera phase from capture clocks and resample onto the primary cadence."""
+) -> tuple[dict[str, CameraPlan], list[str]]:
+    """Estimate camera phase from capture clocks and resample onto the primary cadence.
+
+    Cameras may start or stop at slightly different times. The grid covers only the interval every camera recorded, and
+    a warning says how much footage was left out.
+    """
     topics = {view["channel"] for view in views}
     if not topics <= boundaries.keys():
-        return {}
+        return {}, []
     times = _capture_times(source, boundaries, topics)
     reference = times[primary]
     if len(reference) < 2:  # noqa: PLR2004
-        return {}
+        return {}, []
     # Nomadic remuxes camera frames at an integer fps. Use that same presentation clock.
     cadence = median(b - a for a, b in pairwise(reference))
     fps = max(1, round(1_000_000_000 / cadence))
     period = round(1_000_000_000 / fps)
-    grid = [reference[0] + index * period for index in range(round((reference[-1] - reference[0]) / period) + 1)]
-    plans = {}
+    aligned, offsets = {}, {}
     for topic, stamps in times.items():
         if len(stamps) < 2 or max(b - a for a, b in pairwise(stamps)) > 3 * period:  # noqa: PLR2004
             raise ValueError("A camera has a long gap; refusing to fill missing footage.")
-        offset = (
+        offsets[topic] = (
             0
             if topic == primary
             else int(
                 median(value - (reference[0] + round((value - reference[0]) / period) * period) for value in stamps)
             )
         )
-        aligned = [value - offset for value in stamps]
+        aligned[topic] = [value - offsets[topic] for value in stamps]
+    # A grid point is usable when every camera has a frame within 1.5 periods of it.
+    tolerance = period * 1.5
+    first = max(stamps[0] for stamps in aligned.values()) - tolerance
+    last = min(stamps[-1] for stamps in aligned.values()) + tolerance
+    full = range(round((reference[-1] - reference[0]) / period) + 1)
+    grid = [reference[0] + index * period for index in full if first <= reference[0] + index * period <= last]
+    if len(grid) < 2:  # noqa: PLR2004
+        raise ValueError("The cameras do not record a common interval.")
+    plans = {}
+    for topic, stamps in aligned.items():
         indices = []
         for timestamp in grid:
-            insertion = bisect_left(aligned, timestamp)
-            candidates = [index for index in (insertion - 1, insertion) if 0 <= index < len(aligned)]
-            selected = min(candidates, key=lambda index: (abs(aligned[index] - timestamp), index))
-            if abs(aligned[selected] - timestamp) > period * 1.5:
-                raise ValueError("The cameras do not cover the same recording interval.")
-            indices.append(selected)
-        plans[topic] = CameraPlan(grid, indices, len(stamps), offset)
-    return plans
+            insertion = bisect_left(stamps, timestamp)
+            candidates = [index for index in (insertion - 1, insertion) if 0 <= index < len(stamps)]
+            indices.append(min(candidates, key=lambda index: (abs(stamps[index] - timestamp), index)))
+        plans[topic] = CameraPlan(grid, indices, len(times[topic]), offsets[topic])
+    warnings = []
+    if len(grid) < len(full):
+        lead, tail = (grid[0] - reference[0]) / 1e9, (reference[-1] - grid[-1]) / 1e9
+        warnings.append(
+            f"The cameras started or stopped at different times, so only the interval all cameras recorded was "
+            f"annotated: {lead:.2f} s left out at the start and {tail:.2f} s at the end. Annotation times count from "
+            "the start of that interval."
+        )
+    return plans, warnings
 
 
 def write_calibrations(writer: Writer, source: Path, cameras: tuple[CameraSegment, ...]) -> int:

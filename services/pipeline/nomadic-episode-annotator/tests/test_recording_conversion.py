@@ -48,15 +48,40 @@ def test_alignment_repeats_a_dropped_frame_and_estimates_camera_phase(tmp_path: 
         for index, camera in enumerate(cameras)
     }
     views = [{"channel": camera.dataset_topic} for camera in cameras]
-    plans = alignment_plan(source, boundaries, views, cameras[0].dataset_topic)
+    plans, warnings = alignment_plan(source, boundaries, views, cameras[0].dataset_topic)
+    assert not warnings
     assert all(plan.indices == [0, 1, 1, 2, 3] for plan in plans.values())
     assert {tuple(plan.timestamps) for plan in plans.values()} == {
         tuple(T0 + index * 100_000_000 for index in range(5))
     }
     assert [plans[camera.dataset_topic].offset_ns for camera in cameras] == [0, 10_000_000, 20_000_000]
     boundaries[cameras[1].dataset_topic]["frame_timestamps"] = [stamp + 20_000_000_000 for stamp in stamps]
-    with pytest.raises(ValueError, match="same recording interval"):
+    with pytest.raises(ValueError, match="common interval"):
         alignment_plan(source, boundaries, views, cameras[0].dataset_topic)
+
+
+def test_alignment_keeps_the_interval_all_cameras_share(tmp_path: Path) -> None:
+    source = tmp_path / "source.mcap"
+    processed_reference_recording(source, video_frames=10)
+    cameras = PolicyContract.from_yaml(CONTRACT).cameras
+    frame = 100_000_000
+    head = [T0 + index * frame for index in range(10)]
+    # One wrist camera starts three frames late, the other stops two frames early.
+    late = [stamp + 3 * frame for stamp in head]
+    early = [stamp - 2 * frame for stamp in head]
+    timestamps = dict(zip((camera.dataset_topic for camera in cameras), (head, late, early), strict=True))
+    boundaries = {topic: {"frame_timestamps": stamps} for topic, stamps in timestamps.items()}
+    views = [{"channel": camera.dataset_topic} for camera in cameras]
+    plans, warnings = alignment_plan(source, boundaries, views, cameras[0].dataset_topic)
+    # Edges within 1.5 frames of a camera's first or last frame repeat that frame, as for short gaps.
+    assert {tuple(plan.timestamps) for plan in plans.values()} == {tuple(head[2:9])}
+    assert [plans[topic].indices for topic in timestamps] == [
+        [2, 3, 4, 5, 6, 7, 8],
+        [0, 0, 1, 2, 3, 4, 5],
+        [4, 5, 6, 7, 8, 9, 9],
+    ]
+    assert len(warnings) == 1
+    assert "0.20 s left out at the start and 0.10 s at the end" in warnings[0]
 
 
 def test_nominal_fr3_flange_geometry_and_quaternion() -> None:
@@ -150,7 +175,7 @@ def test_camera_grid_matches_fixed_playback_rate_despite_timestamp_jitter(tmp_pa
     cameras = PolicyContract.from_yaml(CONTRACT).cameras
     stamps = [T0 + value for value in (0, 100_100_000, 200_200_000, 400_400_000)]
     boundaries = {camera.dataset_topic: {"frame_timestamps": stamps} for camera in cameras}
-    plans = alignment_plan(
+    plans, _ = alignment_plan(
         source, boundaries, [{"channel": c.dataset_topic} for c in cameras], cameras[0].dataset_topic
     )
     assert all(plan.timestamps == [T0 + i * 100_000_000 for i in range(5)] for plan in plans.values())

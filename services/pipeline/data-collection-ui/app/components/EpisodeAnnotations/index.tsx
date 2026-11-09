@@ -94,7 +94,8 @@ export default function EpisodeAnnotations({ id, initialStatus }: { id: string; 
   const endpoint = `/api/annotations?episode_id=${encodeURIComponent(id)}`
   const { state } = fetcher
 
-  const canStart = status.can_submit && !active && !job?.remote_started && job?.state !== 'completed'
+  // The annotator decides when an episode with earlier remote work may be started again.
+  const canStart = status.can_submit && !active && job?.state !== 'completed'
 
   if (!status.enabled) return null
   if (status.setup) {
@@ -129,7 +130,7 @@ export default function EpisodeAnnotations({ id, initialStatus }: { id: string; 
       {canStart && (
         <fetcher.Form method='post' action={endpoint}>
           <button className={NOMADIC_BUTTON} type='submit' disabled={state !== 'idle'}>
-            <NomadicMark className='h-4 w-4' /> Auto Annotate with Nomadic
+            <NomadicMark className='h-4 w-4' /> {job?.remote_started ? 'Start again' : 'Auto Annotate with Nomadic'}
           </button>
         </fetcher.Form>
       )}

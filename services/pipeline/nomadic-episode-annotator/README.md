@@ -6,7 +6,7 @@ interactions. Stations without this service run unchanged.
 
 ## Interface
 
-- HTTP on `127.0.0.1:3005` (loopback only), under `/api/v1/episodes/{episode_id}/annotations`, plus
+- HTTP on `127.0.0.1:3050` (loopback only), under `/api/v1/episodes/{episode_id}/annotations`, plus
   `/api/v1/station/api-key` to connect the station from the episode page.
 - Reads processed episodes from `/workspace/data/processed_episodes` (read-only).
 - Keeps job state in `/workspace/data/nomadic_annotations` (read-write).
@@ -35,10 +35,24 @@ Read this before enabling the service, and confirm the decision with whoever own
   follow that account's terms with Nomadic, not LABS.
 - **When:** only when an operator selects **Auto Annotate with Nomadic** for one saved episode. Nothing is sent in the
   background, and uploads or analyses with an uncertain outcome are never retried automatically. Continuing a job from
-  the panel never uploads the recording again: it fetches a saved analysis, waits again for a saved upload, or analyzes
-  a saved upload that Nomadic declined for lack of credits.
+  the panel never uploads the recording again: it fetches a saved analysis, waits again for a saved upload or annotation
+  run, or analyzes a saved upload that Nomadic declined for lack of credits. **Start again**, offered only when nothing
+  can be continued, uploads the recording again.
 - **What stays local:** the API key (never sent back to the browser or logged), raw episodes, the original processed
   recording, other episodes and the job store. The prepared copy is deleted from the station once the job ends.
+
+## Nomadic account and billing
+
+Each station uses one Nomadic account, through its API key.
+
+1. On a station without a key, the annotation panel links to a Nomadic sign-up page made for LABS
+   (`https://app.nomadicml.com/signup?partner=franka-labs`). An existing Nomadic account works too.
+2. Verify the account's email address.
+3. Generate an API key under **Profile → API keys** and paste it into the panel, or set `NOMADIC_API_KEY`.
+
+Annotation is paid from the Nomadic account's credit. For current rates, the balance and buying credit, see **Profile →
+Billing** in Nomadic. When the credit runs out, the panel says so and links to that page; the run then continues from
+the saved upload.
 
 ## Setup
 
@@ -113,7 +127,7 @@ not referenced in `docker-compose.nomadic.yml`, add it to the service's `environ
 
 | Variable                          | Default                               | When to override                                               |
 | --------------------------------- | ------------------------------------- | -------------------------------------------------------------- |
-| `NOMADIC_ENABLED`                 | `false`                               | Enable annotations; the example override sets this to `true`.  |
+| `NOMADIC_ENABLED`                 | `true` in compose; otherwise `false`  | Set `false` to turn annotations off but keep the service.      |
 | `NOMADIC_API_KEY`                 | Unset                                 | Nomadic account credential; otherwise connect from the UI.     |
 | `NOMADIC_POLICY_CONTRACT_PATH`    | Unset; set by the example override    | Existing LABS reference I/O contract.                          |
 | `NOMADIC_SPEC_PATH`               | Unset                                 | Spec for an already compatible recording.                      |
@@ -149,6 +163,40 @@ Hand and Objects columns appear only when data is present. Every returned action
 download includes the complete returned `structured_output`, including fields not displayed in the table. Missing fields
 are left empty rather than inferred from descriptions.
 
+## Saved annotations
+
+The state directory (`/workspace/data/nomadic_annotations`, mounted from `${DATA_ROOT}/nomadic_annotations`) holds:
+
+- `jobs.sqlite3`: every annotation job and its results. Back it up with the directory; do not edit it.
+- `station_key.json`: the API key connected from the episode page, if any. Readable only by the annotator.
+- `prepared/`: the temporary H.264 copy of a recording while it is uploaded. Deleted when the job ends.
+- `worker.lock`: ensures that only one annotator process uses the directory.
+
+Results are not written as separate files. **Download annotations** on the episode page, or
+`GET /api/v1/episodes/{episode_id}/annotations/download`, returns `{episode_id}-annotations.json` for a completed job:
+
+| Field                                               | Content                                                      |
+| --------------------------------------------------- | ------------------------------------------------------------ |
+| `episode_id`, `job_id`                              | The LABS episode and this annotation attempt.                |
+| `state`, `message`, `created_at`, `updated_at`      | Job outcome and UTC timestamps.                              |
+| `source_sha256`                                     | SHA-256 of the processed MCAP that was annotated.            |
+| `video_id`, `batch_id`, `analysis_id`, `viewer_url` | Nomadic references and the Workbench link for the recording. |
+| `warnings`                                          | Notes from preparation, such as nominal robot placement.     |
+| `events`                                            | The actions, in time order; fields below.                    |
+
+Each entry of `events`:
+
+| Field                          | Content                                                                   |
+| ------------------------------ | ------------------------------------------------------------------------- |
+| `start_seconds`, `end_seconds` | Action window, in seconds from the start of the recording.                |
+| `description`, `category`      | The action in words and its category.                                     |
+| `acting_hand`                  | `left`, `right`, `both` or `null`.                                        |
+| `objects`, `action_classes`    | Objects involved and action class tags.                                   |
+| `gripper_transitions`          | Gripper opening and closing within the action.                            |
+| `object_interactions`          | Interactions with objects, as text or as structured entries.              |
+| `structured_output`            | Everything Nomadic returned for the action, including undisplayed fields. |
+| `event_id`                     | Nomadic's identifier for the action.                                      |
+
 ## Recordings
 
 An episode must be saved and have the processor's `.processing_complete` marker. A single processed MCAP is required;
@@ -156,8 +204,10 @@ raw recordings and multi-file stitching are not supported.
 
 LABS whole-video camera messages are converted to H.264 frames. For the reference station, camera clocks are anchored to
 the recorded capture stamps and aligned to the head camera's fixed playback rate. Short gaps repeat the nearest frame;
-the prepared spec records camera offsets and repeated frames. Long gaps, mismatched frame counts and non-increasing
-timestamps are rejected before upload. Existing supported compressed frames or images are preserved.
+the prepared spec records camera offsets and repeated frames. When the cameras start or stop at different times, only
+the interval all of them recorded is annotated, annotation times count from its start, and the result shows a warning.
+Long gaps, cameras without a common interval, mismatched frame counts and non-increasing timestamps are rejected before
+upload. Existing supported compressed frames or images are preserved.
 
 ### Reference station mapping
 
@@ -193,8 +243,12 @@ accuracy should also be reviewed against the intended annotation task.
 - **Mapping or preparation error:** check the recording and mapping. Failures before upload can be corrected and
   submitted again.
 - **Queue full:** wait for a running annotation to finish, then retry.
-- **Upload, processing or annotation interrupted:** inspect the saved references and Nomadic workspace before submitting
-  again. The service does not repeat uploads or analyses after an uncertain outcome.
+- **Upload, processing or annotation interrupted:** use **Continue with the saved upload** when offered; it waits for
+  the saved upload or annotation run again and never starts a second analysis. When nothing can be continued, such as an
+  upload whose answer was lost, the panel offers **Start again**, which uploads the recording again. The service never
+  repeats uploads or analyses on its own.
+- **Nomadic reports that processing or annotation failed:** nothing is still running, so the panel offers **Start
+  again**.
 - **Not enough Nomadic credits:** Nomadic declined the analysis before starting it, so nothing was charged and the
   recording stays uploaded. Top up from the link in the panel, then use **Retry annotation**; the saved upload is
   analyzed without uploading again.
@@ -204,12 +258,17 @@ accuracy should also be reviewed against the intended annotation task.
   without uploading or analyzing again.
 - **Processing result was not received:** use **Continue with the saved upload** when offered. This waits for Nomadic to
   finish the saved upload without sending it again.
-- **Service restarted during annotation:** the job is marked interrupted. Known Nomadic identifiers are retained for
-  inspection or retrieval.
+- **Service restarted during annotation:** the job is marked interrupted and keeps its Nomadic references. The
+  annotation run is saved as soon as it starts, so **Continue** follows the same run after a restart and nothing is
+  analyzed twice.
 - **Storage unavailable:** check that the state directory is writable and persistent. Do not remove annotation state to
   retry a job that may already exist in Nomadic.
 - **Annotation temporarily unavailable on the episode page:** the UI cannot reach the service; check that it is running
-  on port `3005`. The rest of the episode page remains available.
+  on port `3050`. The rest of the episode page remains available.
+
+## Contact
+
+Nomadic maintains this service and supports Nomadic accounts and billing: support@nomadicml.com.
 
 ## Development
 

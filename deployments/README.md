@@ -212,7 +212,7 @@ services use host networking, so give each one its own port.
 
 | Override                     | Services                    | Port | Docs                                                               |
 | ---------------------------- | --------------------------- | ---- | ------------------------------------------------------------------ |
-| `docker-compose.nomadic.yml` | `nomadic-episode-annotator` | 3005 | [README](../services/pipeline/nomadic-episode-annotator/README.md) |
+| `docker-compose.nomadic.yml` | `nomadic-episode-annotator` | 3050 | [README](../services/pipeline/nomadic-episode-annotator/README.md) |
 
 ### Cross-Service URL Dependencies
 

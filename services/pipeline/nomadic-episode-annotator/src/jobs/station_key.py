@@ -24,3 +24,8 @@ def save(state_path: Path, api_key: str, email: str | None) -> None:
     with os.fdopen(descriptor, "w") as handle:
         json.dump({"api_key": api_key, "email": email}, handle)
     partial.replace(state_path / FILE_NAME)
+
+
+def remove(state_path: Path) -> None:
+    """Forget the connected key, for example when the worker could not start with it."""
+    (state_path / FILE_NAME).unlink(missing_ok=True)

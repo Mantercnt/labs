@@ -30,10 +30,10 @@ class CountingGateway(FakeGateway):
             type(self).uploads += 1
         return "ingest-1"
 
-    def index(self, video_id: str) -> IndexResult:
+    def start_index(self, video_id: str) -> IndexResult:
         with self.lock:
             type(self).indexes += 1
-        return super().index(video_id)
+        return super().start_index(video_id)
 
 
 @pytest.fixture(autouse=True)
@@ -45,11 +45,11 @@ def reset_counts() -> None:
 class NoCredits(CountingGateway):
     """Declines the first annotation for credits, as Nomadic does before creating any analysis."""
 
-    def index(self, video_id: str) -> IndexResult:
+    def start_index(self, video_id: str) -> IndexResult:
         if type(self).indexes == 0:
             type(self).indexes += 1
             raise BillingDeclinedError("out_of_credits", 0.05, 0.13)
-        return super().index(video_id)
+        return super().start_index(video_id)
 
 
 class UploadsDisabled(CountingGateway):
@@ -70,7 +70,7 @@ class EarlyIngest(CountingGateway):
 
 
 class BrokenIndex(CountingGateway):
-    def index(self, video_id: str) -> IndexResult:
+    def start_index(self, video_id: str) -> IndexResult:
         raise ConnectionError("connection reset while indexing")
 
 
@@ -134,13 +134,15 @@ def test_a_saved_upload_resumes_from_the_ingest_wait(config: AnnotationConfig) -
         service.close()
 
 
-def test_an_annotation_with_an_unknown_outcome_is_not_started_again(config: AnnotationConfig) -> None:
+def test_an_annotation_whose_start_was_not_confirmed_can_be_started_again(config: AnnotationConfig) -> None:
     episode, _ = saved_episode(config)
     service = started(AnnotationService(config, BrokenIndex))
     try:
         service.submit(episode)
         job = wait_for_job(service, episode, "interrupted")
-        assert job.video_id and not job.batch_id and job.billing is None
-        assert not service.status(episode).can_resume
+        assert job.video_id and not job.index_run_id and job.billing is None
+        assert "Check Nomadic Workbench" in job.message
+        status = service.status(episode)
+        assert status.can_submit and not status.can_resume
     finally:
         service.close()

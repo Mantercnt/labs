@@ -196,7 +196,9 @@ class RecordingPreparer:
         # Prepared copies retain conversion_info, but already contain per-frame camera messages.
         prepared_copy = any(record.name == "nomadic_preparation" for record in metadata)
         boundaries = {} if prepared_copy else conversion.get("frame_boundaries") or {}
-        plans = alignment_plan(source, boundaries, spec["views"], spec["primary_view"]) if reference else {}
+        plans, trimmed = (
+            alignment_plan(source, boundaries, spec["views"], spec["primary_view"]) if reference else ({}, [])
+        )
         _record_provenance(source, episode_id, spec, plans)
         camera_topics = {view["channel"] for view in spec["views"]}
         spec["recording"].update(id=str(episode_id), clock="log_time")
@@ -237,7 +239,7 @@ class RecordingPreparer:
             temporary.replace(output)
         finally:
             temporary.unlink(missing_ok=True)
-        return digest, warnings
+        return digest, warnings + trimmed
 
     def _mapping(self, summary: Summary, metadata: list[Any]) -> tuple[dict[str, Any], ReferenceStationMapping | None]:
         """Prefer explicit or embedded specs, then the configured LABS reference contract."""

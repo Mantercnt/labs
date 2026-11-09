@@ -31,6 +31,10 @@ class InvalidApiKeyError(ValueError):
     """Nomadic rejected the API key."""
 
 
+class RemoteFailedError(Exception):
+    """Nomadic finished a step and reported that it failed, so no remote work for it is still running."""
+
+
 BillingReason = Literal["out_of_credits", "uploads_not_enabled"]
 
 
@@ -56,8 +60,12 @@ class AnnotationGateway(Protocol):
         """Wait for ingestion and return the primary video identifier."""
         ...
 
-    def index(self, video_id: str) -> IndexResult:
-        """Run action indexing for one video."""
+    def start_index(self, video_id: str) -> IndexResult:
+        """Start action indexing for one video and return its run reference without waiting for the result."""
+        ...
+
+    def wait_index(self, video_id: str, run_id: str) -> IndexResult:
+        """Wait for a started indexing run; an incomplete result means it may still be running."""
         ...
 
     def analysis_id(self, batch_id: str, video_id: str) -> str | None:
