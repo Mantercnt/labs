@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0] - UNRELEASED
+
+- Episode metadata models, device enums and the on-disk episode layout moved from data-collection into a shared
+  `pipeline-episodes` package, so other pipeline services can read episodes without depending on data-collection.
+- Added the optional `nomadic-episode-annotator` service, which sends a saved episode to Nomadic for timestamped action
+  annotation and shows results in an annotation panel on the `data-collection-ui` episode page. Enabling it uploads
+  episode data to Nomadic; see the service README before turning it on.
+
 ## [0.2.1] - 2026-09-10
 
 - Fixed sporadic `libfranka: incorrect object size` errors that aborted one or both arms on roughly half of all
